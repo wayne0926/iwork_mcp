@@ -207,6 +207,55 @@ end run
   }
 }
 
+// Documents this server created that haven't been saved to a user path yet
+const createdDocuments = new Set<string>();
+
+/** Record a document created by a tool, so its untitled auto-save can be cleaned up. */
+export function rememberCreatedDocument(appName: IWorkApp, name: string): void {
+  createdDocuments.add(createdKey(appName, name));
+}
+
+function createdKey(appName: IWorkApp, name: string): string {
+  const ext = EXT_MAP[appName];
+  return `${appName}:${name.endsWith(ext) ? name.slice(0, -ext.length) : name}`;
+}
+
+/** The iCloud auto-save of a document a tool created, or null. */
+export async function untitledAutoSavePath(appName: IWorkApp, documentName: string): Promise<string | null> {
+  if (!createdDocuments.has(createdKey(appName, documentName))) return null;
+  const path = await runJXA<string | null>(
+    `
+    const f = Application("${resolveAppName(appName)}").documents.byName(params.documentName).file();
+    return JSON.stringify(f ? f.toString() : null);
+    `,
+    { documentName },
+    { label: "untitledAutoSavePath" },
+  ).catch(() => null);
+  return path && path.includes("/Library/Mobile Documents/") ? path : null;
+}
+
+/** Move a tool-created document's untitled auto-save to the Trash once no open document uses it. */
+export async function trashUntitledAutoSave(appName: IWorkApp, documentName: string, path: string): Promise<void> {
+  createdDocuments.delete(createdKey(appName, documentName));
+  // Waiting first, or Keynote may report the document can't be opened
+  await runJXA<void>(
+    `
+    ObjC.import("Foundation");
+    const app = Application("${resolveAppName(appName)}");
+    function inUse() {
+      return app.documents().some(function (d) {
+        try { const f = d.file(); return f && f.toString() === params.path; } catch (e) { return false; }
+      });
+    }
+    for (let i = 0; i < 10 && inUse(); i++) delay(0.5);
+    if (inUse()) return;
+    $.NSFileManager.defaultManager.trashItemAtURLResultingItemURLError($.NSURL.fileURLWithPath(params.path), null, null);
+    `,
+    { path },
+    { label: "trashUntitledAutoSave" },
+  ).catch(() => {});
+}
+
 /**
  * Creator Studio workaround for "Save As" (doc.save({in:}) hangs).
  * Copies the auto-saved iCloud file, then closes + reopens from the new path.
@@ -258,6 +307,11 @@ export async function creatorStudioSaveAs(
     { targetPath },
     { label: "creatorStudioSaveAs:reopen" },
   );
+
+  // Untitled documents are auto-saved to iCloud before Save As; don't leave that copy behind
+  if (createdDocuments.has(createdKey(appName, documentName)) && autoSavePath.includes("/Library/Mobile Documents/") && autoSavePath !== targetPath) {
+    await trashUntitledAutoSave(appName, documentName, autoSavePath);
+  }
 
   return newName;
 }

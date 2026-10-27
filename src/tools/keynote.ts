@@ -3,10 +3,15 @@ import { existsSync, realpathSync } from "node:fs";
 import { promisify } from "node:util";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioKeynoteExportPDF, clickMenuItem, resolveAppName } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioKeynoteExportPDF, rememberCreatedDocument, untitledAutoSavePath, trashUntitledAutoSave, clickMenuItem, resolveAppName } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 const execFileAsync = promisify(execFile);
+
+function rememberCreated<T extends { name: string }>(result: T): T {
+  rememberCreatedDocument("Keynote", result.name.replace(/\.key$/, ""));
+  return result;
+}
 
 function toolResult(text: string, isError = false) {
   return { content: [{ type: "text" as const, text }], isError };
@@ -193,7 +198,7 @@ export function registerKeynoteTools(server: McpServer): void {
       ...SLIDE_SIZE_SCHEMA,
     },
     ANNOTATIONS.readWrite,
-    async ({ themeName, width, height }) => handleJXA(() => runJXA<string>(`
+    async ({ themeName, width, height }) => handleJXA(async () => rememberCreated(await runJXA<{ name: string }>(`
       const app = Application("Keynote");
       let doc;
       if (params.themeName) {
@@ -205,7 +210,7 @@ export function registerKeynoteTools(server: McpServer): void {
       }
       ${APPLY_SLIDE_SIZE}
       return JSON.stringify({ name: doc.name(), slideCount: doc.slides.length, width: doc.width(), height: doc.height() });
-    `, { themeName: themeName ?? null, width: width ?? null, height: height ?? null })),
+    `, { themeName: themeName ?? null, width: width ?? null, height: height ?? null }))),
   );
 
   server.tool(
@@ -326,7 +331,10 @@ export function registerKeynoteTools(server: McpServer): void {
       saving: z.enum(["yes", "no", "ask"]).optional().describe("Whether to save before closing"),
     },
     ANNOTATIONS.destructive,
-    async ({ documentName, saving }) => handleJXA(() => runJXA<string>(`
+    async ({ documentName, saving }) => handleJXA(async () => {
+      // Creator Studio keeps the iCloud auto-save of an untitled document even when closed without saving
+      const autoSave = isCreatorStudio() && saving === "no" ? await untitledAutoSavePath("Keynote", documentName) : null;
+      const result = await runJXA<string>(`
       const app = Application("Keynote");
       const doc = app.documents.byName(params.documentName);
       const saveOpts = { yes: "yes", no: "no", ask: "ask" };
@@ -336,7 +344,10 @@ export function registerKeynoteTools(server: McpServer): void {
         doc.close();
       }
       return JSON.stringify({ closed: true });
-    `, { documentName, saving: saving ?? null })),
+    `, { documentName, saving: saving ?? null });
+      if (autoSave) await trashUntitledAutoSave("Keynote", documentName, autoSave);
+      return result;
+    }),
   );
 
   // ── Slide Tools ──
@@ -1407,7 +1418,7 @@ export function registerKeynoteTools(server: McpServer): void {
       ...SLIDE_SIZE_SCHEMA,
     },
     ANNOTATIONS.readWrite,
-    async ({ themeName, slides, width, height }) => handleJXA(() => runJXA<string>(`
+    async ({ themeName, slides, width, height }) => handleJXA(async () => rememberCreated(await runJXA<{ name: string }>(`
       const app = Application("Keynote");
 
       // Create presentation
@@ -1499,7 +1510,7 @@ export function registerKeynoteTools(server: McpServer): void {
       slides: slides.map(s => s.transition ? { ...s, transition: { ...s.transition, effect: normalizeTransitionEffect(s.transition.effect) } } : s),
       width: width ?? null,
       height: height ?? null,
-    })),
+    }))),
   );
 
   // ── Creator Studio Features (require subscription) ──
