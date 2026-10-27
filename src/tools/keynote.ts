@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioExportPDF, clickMenuItem, resolveAppName } from "../jxa.js";
+import { runJXA, OsascriptError, isCreatorStudio, creatorStudioSaveAs, creatorStudioKeynoteExportPDF, clickMenuItem, resolveAppName } from "../jxa.js";
 import { ANNOTATIONS } from "../annotations.js";
 
 function toolResult(text: string, isError = false) {
@@ -32,6 +32,41 @@ async function handleJXA<T>(fn: () => Promise<T>): Promise<{ content: { type: "t
     return toolResult(String(err), true);
   }
 }
+
+// AppleScript bridge for what JXA can't do (master slides, "after slide N").
+// A failed call returns a truthy nil wrapper, hence isNil(); Ref() for the error crashes osascript.
+const KEYNOTE_AS_HELPERS = `
+    ObjC.import("Foundation");
+    function asQuote(s) {
+      return '"' + String(s).replace(/\\\\/g, "\\\\\\\\").replace(/"/g, '\\\\"') + '"';
+    }
+    function runAS(src) {
+      const script = $.NSAppleScript.alloc.initWithSource(src);
+      const err = $();
+      const result = script.executeAndReturnError(err);
+      if (!result || (result.isNil && result.isNil())) {
+        let info = {};
+        try { info = ObjC.deepUnwrap(err) || {}; } catch (e) {}
+        const msg = info.NSAppleScriptErrorBriefMessage || info.NSAppleScriptErrorMessage || "AppleScript execution failed";
+        throw new Error(info.NSAppleScriptErrorNumber !== undefined ? msg + " (" + info.NSAppleScriptErrorNumber + ")" : msg);
+      }
+      return result;
+    }
+    function docRef() { return "document " + asQuote(params.documentName); }
+`;
+
+const SLIDE_SIZE_SCHEMA = {
+  width: z.number().int().positive().optional().describe("Slide width in points (e.g. 1920 for 16:9, 1024 for 4:3). Default: theme default"),
+  height: z.number().int().positive().optional().describe("Slide height in points (e.g. 1080 for 16:9, 768 for 4:3). Default: theme default"),
+};
+
+const APPLY_SLIDE_SIZE = `
+      if (params.width !== null) doc.width = params.width;
+      if (params.height !== null) doc.height = params.height;
+      if ((params.width !== null && doc.width() !== params.width) || (params.height !== null && doc.height() !== params.height)) {
+        throw new Error("Keynote did not apply the slide size (document " + doc.name() + " is " + doc.width() + "x" + doc.height() + ")");
+      }
+`;
 
 export function registerKeynoteTools(server: McpServer): void {
   // ── Presentation Management ──
@@ -91,12 +126,13 @@ export function registerKeynoteTools(server: McpServer): void {
 
   server.tool(
     "keynote_create_presentation",
-    "Create a new Keynote presentation (optionally with a theme — use keynote_list_themes to see available themes)",
+    "Create a new Keynote presentation (optionally with a theme — use keynote_list_themes to see available themes — and a slide size)",
     {
       themeName: z.string().optional().describe("Theme name (optional, e.g. 'White', 'Black', 'Gradient')"),
+      ...SLIDE_SIZE_SCHEMA,
     },
     ANNOTATIONS.readWrite,
-    async ({ themeName }) => handleJXA(() => runJXA<string>(`
+    async ({ themeName, width, height }) => handleJXA(() => runJXA<string>(`
       const app = Application("Keynote");
       let doc;
       if (params.themeName) {
@@ -106,8 +142,9 @@ export function registerKeynoteTools(server: McpServer): void {
         doc = app.Document();
         app.documents.push(doc);
       }
-      return JSON.stringify({ name: doc.name(), slideCount: doc.slides.length });
-    `, { themeName: themeName ?? null })),
+      ${APPLY_SLIDE_SIZE}
+      return JSON.stringify({ name: doc.name(), slideCount: doc.slides.length, width: doc.width(), height: doc.height() });
+    `, { themeName: themeName ?? null, width: width ?? null, height: height ?? null })),
   );
 
   server.tool(
@@ -167,8 +204,8 @@ export function registerKeynoteTools(server: McpServer): void {
     ANNOTATIONS.readWrite,
     async ({ documentName, filePath, format }) => handleJXA(async () => {
       if (isCreatorStudio() && format === "PDF") {
-        await creatorStudioExportPDF("Keynote", documentName, filePath);
-        return JSON.stringify({ exported: true, path: filePath, format: "PDF" });
+        const { method, pageCount } = await creatorStudioKeynoteExportPDF(documentName, filePath);
+        return JSON.stringify({ exported: true, path: filePath, format: "PDF", method, pageCount });
       }
       return runJXA<string>(`
       const app = Application("Keynote");
@@ -251,11 +288,26 @@ export function registerKeynoteTools(server: McpServer): void {
       let notes = "";
       try { notes = slide.presenterNotes(); } catch(e) {}
 
+      // Placeholders show up in both textItems() and shapes(); same text + geometry = same box
+      const seen = {};
+      function isRepeat(item, text) {
+        let key;
+        try {
+          const p = item.position();
+          key = [text, Math.round(p.x), Math.round(p.y), Math.round(item.width()), Math.round(item.height())].join("|");
+        } catch(e) { return false; }
+        if (seen[key]) return true;
+        seen[key] = true;
+        return false;
+      }
+
       const textItems = [];
       try {
         const items = slide.textItems();
         for (let i = 0; i < items.length; i++) {
-          textItems.push({ index: i, text: items[i].objectText(), width: items[i].width(), height: items[i].height() });
+          const text = items[i].objectText();
+          if (isRepeat(items[i], text)) continue;
+          textItems.push({ index: i, text: text, width: items[i].width(), height: items[i].height() });
         }
       } catch(e) {}
 
@@ -271,7 +323,9 @@ export function registerKeynoteTools(server: McpServer): void {
       try {
         const shps = slide.shapes();
         for (let i = 0; i < shps.length; i++) {
-          shapes.push({ index: i, text: shps[i].objectText(), width: shps[i].width(), height: shps[i].height() });
+          const text = shps[i].objectText();
+          if (isRepeat(shps[i], text)) continue;
+          shapes.push({ index: i, text: text, width: shps[i].width(), height: shps[i].height() });
         }
       } catch(e) {}
 
@@ -363,18 +417,39 @@ export function registerKeynoteTools(server: McpServer): void {
 
   server.tool(
     "keynote_duplicate_slide",
-    "Duplicate an existing slide",
+    "Duplicate an existing slide, optionally placing the copy at a given position",
     {
       documentName: z.string().describe("Name of the open presentation"),
       slideNumber: z.number().int().min(1).describe("Slide number to duplicate (1-based)"),
+      toSlideNumber: z.number().int().min(1).optional().describe("Slide number the copy should end up at (1-based, up to slide count + 1). Default: end of presentation."),
     },
     ANNOTATIONS.readWrite,
-    async ({ documentName, slideNumber }) => handleJXA(() => runJXA<string>(`
+    async ({ documentName, slideNumber, toSlideNumber }) => handleJXA(() => runJXA<string>(`
+      ${KEYNOTE_AS_HELPERS}
       const app = Application("Keynote");
       const doc = app.documents.byName(params.documentName);
-      app.duplicate(doc.slides[params.slideNumber - 1]);
-      return JSON.stringify({ duplicated: true, totalSlides: doc.slides.length });
-    `, { documentName, slideNumber })),
+      const before = doc.slides.length;
+      if (params.slideNumber > before) {
+        throw new Error("Slide " + params.slideNumber + " is out of range (presentation has " + before + " slides)");
+      }
+      let target;
+      if (params.toSlideNumber === null) {
+        app.duplicate(doc.slides[params.slideNumber - 1]);
+        target = before + 1;
+      } else {
+        target = params.toSlideNumber;
+        if (target > before + 1) {
+          throw new Error("toSlideNumber " + target + " is out of range (max " + (before + 1) + ")");
+        }
+        const loc = target === 1 ? 'before slide 1' : 'after slide ' + (target - 1);
+        runAS('tell application "Keynote" to tell ' + docRef() + ' to duplicate slide ' + params.slideNumber + ' to ' + loc);
+      }
+      const total = doc.slides.length;
+      if (total !== before + 1) {
+        throw new Error("Slide was not duplicated (slide count " + before + " -> " + total + ")");
+      }
+      return JSON.stringify({ duplicated: true, slideNumber: target, totalSlides: total });
+    `, { documentName, slideNumber, toSlideNumber: toSlideNumber ?? null })),
   );
 
   server.tool(
@@ -385,13 +460,8 @@ export function registerKeynoteTools(server: McpServer): void {
     },
     ANNOTATIONS.readOnly,
     async ({ documentName }) => handleJXA(() => runJXA<string>(`
-      ObjC.import("Foundation");
-      const script = $.NSAppleScript.alloc.initWithSource(
-        'tell application "Keynote" to tell document "' + params.documentName.replace(/"/g, '\\\\"') + '" to return name of every master slide'
-      );
-      const errDict = Ref();
-      const result = script.executeAndReturnError(errDict);
-      if (!result) throw new Error("Failed to list master slides");
+      ${KEYNOTE_AS_HELPERS}
+      const result = runAS('tell application "Keynote" to tell ' + docRef() + ' to return name of every master slide');
       const count = result.numberOfItems;
       const names = [];
       for (let i = 1; i <= count; i++) {
@@ -411,11 +481,25 @@ export function registerKeynoteTools(server: McpServer): void {
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, fromSlideNumber, toSlideNumber }) => handleJXA(() => runJXA<string>(`
+      ${KEYNOTE_AS_HELPERS}
       const app = Application("Keynote");
       const doc = app.documents.byName(params.documentName);
-      const slide = doc.slides[params.fromSlideNumber - 1];
-      app.move(slide, { to: doc.slides[params.toSlideNumber - 1] });
-      return JSON.stringify({ moved: true, from: params.fromSlideNumber, to: params.toSlideNumber, totalSlides: doc.slides.length });
+      const total = doc.slides.length;
+      const from = params.fromSlideNumber;
+      const to = params.toSlideNumber;
+      if (from > total || to > total) {
+        throw new Error("Slide number out of range (presentation has " + total + " slides)");
+      }
+      if (from !== to) {
+        // "move ... to slide N" replaces slide N
+        runAS('tell application "Keynote" to tell ' + docRef() + ' to move slide ' + from +
+          ' to ' + (to < from ? 'before' : 'after') + ' slide ' + to);
+        const after = doc.slides.length;
+        if (after !== total) {
+          throw new Error("Slide count changed during move (" + total + " -> " + after + ")");
+        }
+      }
+      return JSON.stringify({ moved: true, from: from, to: to, totalSlides: total });
     `, { documentName, fromSlideNumber, toSlideNumber })),
   );
 
@@ -446,17 +530,8 @@ export function registerKeynoteTools(server: McpServer): void {
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, slideNumber, masterSlideName }) => handleJXA(() => runJXA<string>(`
-      ObjC.import("Foundation");
-      const docName = params.documentName.replace(/"/g, '\\\\"');
-      const masterName = params.masterSlideName.replace(/"/g, '\\\\"');
-      const asCode = 'tell application "Keynote" to tell document "' + docName + '" to set base slide of slide ' + params.slideNumber + ' to master slide "' + masterName + '"';
-      const script = $.NSAppleScript.alloc.initWithSource(asCode);
-      const err = $();
-      const result = script.executeAndReturnError(err);
-      if (!result || result.isNil ? result.isNil() : !result) {
-        const errInfo = ObjC.deepUnwrap(err);
-        throw new Error(errInfo.NSAppleScriptErrorBriefMessage || "Failed to set slide layout");
-      }
+      ${KEYNOTE_AS_HELPERS}
+      runAS('tell application "Keynote" to tell ' + docRef() + ' to set base slide of slide ' + params.slideNumber + ' to master slide ' + asQuote(params.masterSlideName));
       return JSON.stringify({ layoutSet: true, slideNumber: params.slideNumber, masterSlide: params.masterSlideName });
     `, { documentName, slideNumber, masterSlideName })),
   );
@@ -485,38 +560,30 @@ export function registerKeynoteTools(server: McpServer): void {
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, masterSlideName, afterSlide }) => handleJXA(() => runJXA<string>(`
+      ${KEYNOTE_AS_HELPERS}
       const app = Application("Keynote");
       const doc = app.documents.byName(params.documentName);
-
-      if (params.masterSlideName) {
-        // JXA masterSlides bridge is broken — use AppleScript via ObjC
-        ObjC.import("Foundation");
-        const docName = params.documentName.replace(/"/g, '\\\\"');
-        const masterName = params.masterSlideName.replace(/"/g, '\\\\"');
-        let asCode;
-        if (params.afterSlide !== null && params.afterSlide !== undefined) {
-          asCode = 'tell application "Keynote" to tell document "' + docName + '" to make new slide after slide ' + params.afterSlide + ' with properties {base slide:master slide "' + masterName + '"}';
-        } else {
-          asCode = 'tell application "Keynote" to tell document "' + docName + '" to make new slide with properties {base slide:master slide "' + masterName + '"}';
-        }
-        const script = $.NSAppleScript.alloc.initWithSource(asCode);
-        const errDict = Ref();
-        const result = script.executeAndReturnError(errDict);
-        if (!result) {
-          const errInfo = ObjC.deepUnwrap(errDict[0]);
-          throw new Error(errInfo.NSAppleScriptErrorBriefMessage || "Failed to add slide");
-        }
-      } else {
-        const slide = app.Slide({});
-        if (params.afterSlide !== null && params.afterSlide !== undefined) {
-          doc.slides.splice(params.afterSlide, 0, slide);
-        } else {
-          doc.slides.push(slide);
-        }
+      const before = doc.slides.length;
+      const hasAfter = params.afterSlide !== null;
+      if (hasAfter && params.afterSlide > before) {
+        throw new Error("afterSlide " + params.afterSlide + " is out of range (presentation has " + before + " slides)");
       }
 
-      const insertedAt = (params.afterSlide !== null && params.afterSlide !== undefined) ? params.afterSlide + 1 : doc.slides.length;
-      return JSON.stringify({ slideNumber: insertedAt, added: true });
+      if (params.masterSlideName || hasAfter) {
+        // JXA masterSlides bridge is broken and slides.splice() fails (-10002)
+        let asCode = 'tell application "Keynote" to tell ' + docRef() + ' to make new slide';
+        if (hasAfter) asCode += ' at after slide ' + params.afterSlide;
+        if (params.masterSlideName) asCode += ' with properties {base slide:master slide ' + asQuote(params.masterSlideName) + '}';
+        runAS(asCode);
+      } else {
+        doc.slides.push(app.Slide({}));
+      }
+
+      const total = doc.slides.length;
+      if (total !== before + 1) {
+        throw new Error("Slide was not added (slide count " + before + " -> " + total + ")");
+      }
+      return JSON.stringify({ slideNumber: hasAfter ? params.afterSlide + 1 : total, added: true, totalSlides: total });
     `, { documentName, masterSlideName: masterSlideName ?? null, afterSlide: afterSlide ?? null })),
   );
 
@@ -576,12 +643,17 @@ export function registerKeynoteTools(server: McpServer): void {
       const doc = app.documents.byName(params.documentName);
       const slide = doc.slides[params.slideNumber - 1];
       const props = { file: Path(params.filePath) };
-      if (params.x !== null) props.position = [params.x, params.y || 0];
       if (params.width !== null) props.width = params.width;
       if (params.height !== null) props.height = params.height;
-      const image = app.Image(props);
-      slide.images.push(image);
-      return JSON.stringify({ added: true, slideNumber: params.slideNumber });
+      slide.images.push(app.Image(props));
+      const image = slide.images[slide.images.length - 1];
+      // [x, y] is silently ignored; position needs {x, y}
+      if (params.x !== null || params.y !== null) {
+        const cur = image.position();
+        image.position = { x: params.x !== null ? params.x : cur.x, y: params.y !== null ? params.y : cur.y };
+      }
+      const p = image.position();
+      return JSON.stringify({ added: true, slideNumber: params.slideNumber, x: p.x, y: p.y, width: image.width(), height: image.height() });
     `, { documentName, slideNumber, filePath, x: x ?? null, y: y ?? null, width: width ?? null, height: height ?? null })),
   );
 
@@ -603,15 +675,20 @@ export function registerKeynoteTools(server: McpServer): void {
       const doc = app.documents.byName(params.documentName);
       const slide = doc.slides[params.slideNumber - 1];
       const props = {};
-      if (params.x !== null && params.y !== null) props.position = [params.x, params.y];
       if (params.width !== null) props.width = params.width;
       if (params.height !== null) props.height = params.height;
-      const shape = app.Shape(props);
-      slide.shapes.push(shape);
+      slide.shapes.push(app.Shape(props));
+      const shape = slide.shapes[slide.shapes.length - 1];
+      // [x, y] is silently ignored; position needs {x, y}
+      if (params.x !== null || params.y !== null) {
+        const cur = shape.position();
+        shape.position = { x: params.x !== null ? params.x : cur.x, y: params.y !== null ? params.y : cur.y };
+      }
       if (params.text) {
         shape.objectText = params.text;
       }
-      return JSON.stringify({ added: true, slideNumber: params.slideNumber });
+      const p = shape.position();
+      return JSON.stringify({ added: true, slideNumber: params.slideNumber, x: p.x, y: p.y, width: shape.width(), height: shape.height() });
     `, { documentName, slideNumber, text: text ?? null, x: x ?? null, y: y ?? null, width: width ?? 200, height: height ?? 100 })),
   );
 
@@ -1170,9 +1247,10 @@ export function registerKeynoteTools(server: McpServer): void {
           duration: z.number().positive().optional().describe("Duration in seconds"),
         }).optional().describe("Slide transition"),
       })).min(1).describe("Array of slides to create"),
+      ...SLIDE_SIZE_SCHEMA,
     },
     ANNOTATIONS.readWrite,
-    async ({ themeName, slides }) => handleJXA(() => runJXA<string>(`
+    async ({ themeName, slides, width, height }) => handleJXA(() => runJXA<string>(`
       const app = Application("Keynote");
 
       // Create presentation
@@ -1184,9 +1262,17 @@ export function registerKeynoteTools(server: McpServer): void {
         doc = app.Document();
         app.documents.push(doc);
       }
+      ${APPLY_SLIDE_SIZE}
 
-      ObjC.import("Foundation");
-      const docName = doc.name().replace(/"/g, '\\\\"');
+      ${KEYNOTE_AS_HELPERS}
+      const docAS = "document " + asQuote(doc.name());
+      function addSlideWithMaster(masterSlideName, i) {
+        try {
+          runAS('tell application "Keynote" to tell ' + docAS + ' to make new slide with properties {base slide:master slide ' + asQuote(masterSlideName) + '}');
+        } catch (e) {
+          throw new Error("Slide " + (i + 1) + ": " + e.message);
+        }
+      }
       const results = [];
 
       // New presentations always have 1 auto-generated slide.
@@ -1198,15 +1284,7 @@ export function registerKeynoteTools(server: McpServer): void {
           // Reuse the existing first slide — but if a master slide is requested,
           // add the new slide first, then delete the default one.
           if (s.masterSlideName) {
-            const masterName = s.masterSlideName.replace(/"/g, '\\\\"');
-            const asCode = 'tell application "Keynote" to tell document "' + docName + '" to make new slide with properties {base slide:master slide "' + masterName + '"}';
-            const script = $.NSAppleScript.alloc.initWithSource(asCode);
-            const errDict = Ref();
-            const result = script.executeAndReturnError(errDict);
-            if (!result) {
-              const errInfo = ObjC.deepUnwrap(errDict[0]);
-              throw new Error("Slide " + (i + 1) + ": " + (errInfo.NSAppleScriptErrorBriefMessage || "Failed to add slide"));
-            }
+            addSlideWithMaster(s.masterSlideName, i);
             // Delete the original default slide (now at index 0)
             app.delete(doc.slides[0]);
           }
@@ -1214,15 +1292,7 @@ export function registerKeynoteTools(server: McpServer): void {
         } else {
           // Add subsequent slides
           if (s.masterSlideName) {
-            const masterName = s.masterSlideName.replace(/"/g, '\\\\"');
-            const asCode = 'tell application "Keynote" to tell document "' + docName + '" to make new slide with properties {base slide:master slide "' + masterName + '"}';
-            const script = $.NSAppleScript.alloc.initWithSource(asCode);
-            const errDict = Ref();
-            const result = script.executeAndReturnError(errDict);
-            if (!result) {
-              const errInfo = ObjC.deepUnwrap(errDict[0]);
-              throw new Error("Slide " + (i + 1) + ": " + (errInfo.NSAppleScriptErrorBriefMessage || "Failed to add slide"));
-            }
+            addSlideWithMaster(s.masterSlideName, i);
           } else {
             doc.slides.push(app.Slide({}));
           }
@@ -1263,8 +1333,8 @@ export function registerKeynoteTools(server: McpServer): void {
         results.push({ slideNumber: i + 1, title, hasBody, hasNotes });
       }
 
-      return JSON.stringify({ name: doc.name(), slideCount: doc.slides.length, slides: results });
-    `, { themeName: themeName ?? null, slides })),
+      return JSON.stringify({ name: doc.name(), slideCount: doc.slides.length, width: doc.width(), height: doc.height(), slides: results });
+    `, { themeName: themeName ?? null, slides, width: width ?? null, height: height ?? null })),
   );
 
   // ── Creator Studio Features (require subscription) ──

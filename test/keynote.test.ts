@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { unlinkSync } from "node:fs";
 import { createTestServer, type TestContext } from "./helpers/server.js";
 import { isAppAvailable } from "./helpers/app-check.js";
+import { runJXA } from "../src/jxa.js";
 
 async function call(ctx: TestContext, name: string, args: Record<string, unknown> = {}) {
   const result = await ctx.client.callTool({ name, arguments: args });
@@ -27,6 +28,16 @@ describe("Keynote Integration", async () => {
   before(async () => {
     ctx = await createTestServer();
   });
+
+  // Layout and theme names are localized (e.g. "Leer" instead of "Blank" in German)
+  async function layoutNames(): Promise<string[]> {
+    const { json } = await call(ctx, "keynote_list_master_slides", { documentName: docName });
+    return (json as Array<{ name: string }>).map(l => l.name);
+  }
+  async function blankLayout(): Promise<string | undefined> {
+    const names = await layoutNames();
+    return names.find(n => ["Blank", "Leer", "Vide", "Vacío", "Vuoto", "Leeg", "Em branco", "空白"].includes(n));
+  }
 
   after(async () => {
     if (ctx) {
@@ -145,6 +156,7 @@ describe("Keynote Integration", async () => {
     });
     assert.ok(json.duplicated);
     assert.equal(json.totalSlides, countBefore + 1);
+    assert.equal(json.slideNumber, json.totalSlides);
 
     // Clean up: delete the duplicate
     await call(ctx, "keynote_delete_slide", {
@@ -180,6 +192,98 @@ describe("Keynote Integration", async () => {
     assert.equal(content.title, "Slide B");
   });
 
+  it("reorders a slide forward without losing the target slide", async () => {
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.ok(before.length >= 3);
+    for (let i = 1; i <= 3; i++) {
+      await call(ctx, "keynote_set_slide_title", { documentName: docName, slideNumber: i, title: `Order ${i}` });
+    }
+
+    const { json, isError } = await call(ctx, "keynote_reorder_slide", {
+      documentName: docName,
+      fromSlideNumber: 1,
+      toSlideNumber: 3,
+    });
+    assert.ok(!isError && json.moved);
+
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length);
+    assert.deepEqual(after.slice(0, 3).map((s: { title: string }) => s.title), ["Order 2", "Order 3", "Order 1"]);
+  });
+
+  it("adds a slide after a given slide", async () => {
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const { json, isError } = await call(ctx, "keynote_add_slide", { documentName: docName, afterSlide: 1 });
+    assert.ok(!isError && json.added);
+    assert.equal(json.slideNumber, 2);
+    assert.equal(json.totalSlides, before.length + 1);
+
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length + 1);
+    assert.equal(after[2].title, before[1].title, "Former slide 2 should now be slide 3");
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: 2 });
+  });
+
+  it("adds a slide with a master layout after a given slide", async () => {
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const layout = (await layoutNames()).pop();
+    const { json, isError } = await call(ctx, "keynote_add_slide", {
+      documentName: docName, masterSlideName: layout, afterSlide: 1,
+    });
+    assert.ok(!isError && json.added);
+    assert.equal(json.slideNumber, 2);
+
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length + 1);
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: 2 });
+  });
+
+  it("reports an error for an unknown master layout or document", async () => {
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const badMaster = await call(ctx, "keynote_add_slide", {
+      documentName: docName, masterSlideName: "NoSuchLayout", afterSlide: 1,
+    });
+    assert.ok(badMaster.isError);
+    const badDoc = await call(ctx, "keynote_add_slide", {
+      documentName: `NoSuchDocument-${suffix}`, masterSlideName: "Blank",
+    });
+    assert.ok(badDoc.isError);
+
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length);
+  });
+
+  it("duplicates a slide to a given position", async () => {
+    await call(ctx, "keynote_set_slide_title", { documentName: docName, slideNumber: 2, title: "Dup source" });
+    const { json: before } = await call(ctx, "keynote_list_slides", { documentName: docName });
+
+    const { json, isError } = await call(ctx, "keynote_duplicate_slide", {
+      documentName: docName, slideNumber: 2, toSlideNumber: 1,
+    });
+    assert.ok(!isError && json.duplicated);
+    assert.equal(json.slideNumber, 1);
+
+    const { json: after } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    assert.equal(after.length, before.length + 1);
+    assert.equal(after[0].title, "Dup source");
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: 1 });
+  });
+
+  it("creates a presentation with a custom slide size", async () => {
+    const { json, isError } = await call(ctx, "keynote_create_presentation", { width: 1920, height: 1080 });
+    assert.ok(!isError, "create with size should succeed");
+    assert.equal(json.width, 1920);
+    assert.equal(json.height, 1080);
+    await call(ctx, "keynote_close_presentation", { documentName: json.name, saving: "no" });
+  });
+
+  it("lists each text box on a slide only once", async () => {
+    await call(ctx, "keynote_set_slide_title", { documentName: docName, slideNumber: 1, title: "Unique title" });
+    const { json: content } = await call(ctx, "keynote_get_slide_content", { documentName: docName, slideNumber: 1 });
+    const matches = [...content.textItems, ...content.shapes].filter((t: { text: string }) => t.text === "Unique title");
+    assert.ok(matches.length <= 1, `Title listed ${matches.length} times`);
+  });
+
   // ── Layout tools ──
 
   it("positions a shape on a slide", async () => {
@@ -189,10 +293,12 @@ describe("Keynote Integration", async () => {
     const layoutSlide = slides.length;
 
     // Add 3 shapes with known positions
-    await call(ctx, "keynote_add_shape", {
+    const { json: added } = await call(ctx, "keynote_add_shape", {
       documentName: docName, slideNumber: layoutSlide, text: "Shape A",
       x: 50, y: 50, width: 100, height: 80,
     });
+    assert.ok(Math.abs(added.x - 50) < 2, `Expected x~50, got ${added.x}`);
+    assert.ok(Math.abs(added.y - 50) < 2, `Expected y~50, got ${added.y}`);
 
     // Position the shape we just added (index 0 on this fresh slide)
     const { json } = await call(ctx, "keynote_position_item", {
@@ -296,7 +402,8 @@ describe("Keynote Integration", async () => {
     assert.ok(before.theme, "Should return a theme name");
 
     // Change to a different theme
-    const targetTheme = before.theme === "Black" ? "White" : "Black";
+    const { json: themes } = await call(ctx, "keynote_list_themes");
+    const targetTheme = (themes as string[]).find(t => t !== before.theme);
     const { json: setResult } = await call(ctx, "keynote_set_theme", {
       documentName: docName,
       themeName: targetTheme,
@@ -312,13 +419,14 @@ describe("Keynote Integration", async () => {
   // ── Slide layout ──
 
   it("changes a slide layout", async () => {
+    const layout = (await blankLayout()) ?? (await layoutNames()).pop();
     const { json } = await call(ctx, "keynote_set_slide_layout", {
       documentName: docName,
       slideNumber: 1,
-      masterSlideName: "Blank",
+      masterSlideName: layout,
     });
     assert.ok(json.layoutSet);
-    assert.equal(json.masterSlide, "Blank");
+    assert.equal(json.masterSlide, layout);
   });
 
   // ── Slide tables ──
@@ -467,6 +575,16 @@ describe("Keynote Integration", async () => {
     });
     assert.ok(json.exported);
     assert.equal(json.format, "PDF");
+
+    // One PDF page per (non-skipped) slide — Creator Studio used to produce a single blank page
+    const { json: slides } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const expected = (slides as Array<{ skipped: boolean }>).filter(s => !s.skipped).length;
+    const pageCount = await runJXA<number>(`
+      ObjC.import("Quartz");
+      const pdf = $.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(params.path));
+      return JSON.stringify(Number(pdf.pageCount));
+    `, { path: tmpPath });
+    assert.equal(pageCount, expected);
   });
 
   // ── Error on nonexistent presentation ──
