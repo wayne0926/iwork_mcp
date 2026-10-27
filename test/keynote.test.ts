@@ -380,9 +380,10 @@ describe("Keynote Integration", async () => {
       documentName: docName,
       slideNumber: fmtSlide,
       shapeIndex: 0,
-      format: { opacity: 75, rotation: 15, fontName: "HelveticaNeue-Bold", fontSize: 18 },
+      format: { opacity: 75, rotation: 15, fontName: "HelveticaNeue-Bold", fontSize: 18, textColor: "#FFFFFF" },
     });
     assert.ok(fmtResult.formatted);
+    assert.deepEqual(fmtResult.applied, ["opacity", "rotation", "fontName", "fontSize", "textColor"]);
 
     // Verify
     const { json: after } = await call(ctx, "keynote_get_shape_info", {
@@ -392,6 +393,14 @@ describe("Keynote Integration", async () => {
     });
     assert.equal(after.opacity, 75);
     assert.equal(after.rotation, 15);
+    assert.equal(after.textFormat.color, "#ffffff", "White text must not come out near-black");
+
+    // Text alignment isn't scriptable: reject it instead of half-applying the format
+    const { isError } = await call(ctx, "keynote_format_shape", {
+      documentName: docName, slideNumber: fmtSlide, shapeIndex: 0,
+      format: { opacity: 50, textAlignment: "center" },
+    });
+    assert.ok(isError);
   });
 
   // ── Theme tools ──
@@ -588,6 +597,54 @@ describe("Keynote Integration", async () => {
   });
 
   // ── Error on nonexistent presentation ──
+
+  it("returns isError when reading a missing slide or presentation", async () => {
+    for (const tool of ["keynote_get_slide_content", "keynote_list_slide_items"]) {
+      const missingSlide = await call(ctx, tool, { documentName: docName, slideNumber: 99 });
+      assert.ok(missingSlide.isError, `${tool} should fail for slide 99`);
+      const missingDoc = await call(ctx, tool, { documentName: "NoSuchPresentation_999", slideNumber: 1 });
+      assert.ok(missingDoc.isError, `${tool} should fail for a missing presentation`);
+    }
+  });
+
+  it("returns isError when saving a nonexistent presentation", async () => {
+    const { isError } = await call(ctx, "keynote_save_presentation", { documentName: "NoSuchPresentation_999" });
+    assert.ok(isError);
+  });
+
+  it("lists each box once in list_slide_items", async () => {
+    const { json } = await call(ctx, "keynote_list_slide_items", { documentName: docName, slideNumber: 1 });
+    const keys = (json.items as Array<{ type: string; text?: string; width: number; height: number; position: { x: number; y: number } | null }>)
+      .filter(i => i.type === "shape" || i.type === "textItem")
+      .map(i => [i.text, Math.round(i.width), Math.round(i.height), i.position && Math.round(i.position.x), i.position && Math.round(i.position.y)].join("|"));
+    assert.equal(new Set(keys).size, keys.length, "No box should be listed twice");
+  });
+
+  it("makes a hidden title placeholder visible when setting a title", async (t) => {
+    const blank = await blankLayout();
+    if (!blank) return t.skip("no blank layout in this theme");
+    const { json: added } = await call(ctx, "keynote_add_slide", { documentName: docName, masterSlideName: blank });
+    const { json, isError, text } = await call(ctx, "keynote_set_slide_title", {
+      documentName: docName, slideNumber: added.slideNumber, title: "Visible title",
+    });
+    if (!isError) {
+      const { json: slides } = await call(ctx, "keynote_list_slides", { documentName: docName });
+      assert.notEqual(slides[added.slideNumber - 1].titleShowing, false, "Title was written but is hidden");
+      assert.equal(slides[added.slideNumber - 1].title, "Visible title");
+    } else {
+      assert.match(text, /no visible title placeholder/);
+    }
+    assert.ok(isError || json.set);
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber: added.slideNumber });
+  });
+
+  it("accepts 'none' as a transition and explains invalid effect names", async () => {
+    const { json, isError } = await call(ctx, "keynote_set_transition", { documentName: docName, slideNumber: 1, effect: "none" });
+    assert.ok(!isError && json.set);
+    const bad = await call(ctx, "keynote_set_transition", { documentName: docName, slideNumber: 1, effect: "NoSuchEffect" });
+    assert.ok(bad.isError);
+    assert.match(bad.text, /Valid effects: .*dissolve/);
+  });
 
   it("returns isError for a nonexistent presentation", async () => {
     const result = await ctx.client.callTool({
