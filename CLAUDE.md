@@ -3,7 +3,7 @@
 ## Project Overview
 - MCP server for Apple iWork (Numbers, Pages, Keynote) automation via JXA/osascript
 - TypeScript, ESM, uses `@modelcontextprotocol/sdk` v1.26.0
-- 117 tools total: 50 Numbers, 26 Pages, 41 Keynote (includes 8 Creator Studio AI tools)
+- 122 tools total: 50 Numbers, 26 Pages, 46 Keynote (includes 8 Creator Studio AI tools)
 - npm: `iwork-mcp`
 - Requirements: macOS 13+, iWork 14.0+, Node.js 18+
 - Supports both standard iWork and iWork 15.1+ "Creator Studio" app bundles (tested on 15.1.1)
@@ -47,6 +47,7 @@
 - **Keynote hidden placeholders**: Layouts like Blank/Quote keep a title/body placeholder with `titleShowing`/`bodyShowing` = false. Text written there reads back fine but is invisible — set `slide.titleShowing = true` first.
 - **Keynote text alignment**: Not settable via scripting (`objectText.alignment` always errors). Don't expose it.
 - **Keynote transitions**: `transitionEffect` takes the dictionary enumerator name — "no transition effect", not "none". Invalid names fail with an opaque -1700; valid names come from `sdef` (the enumeration containing "magic move").
+- **Keynote single-slide export**: `export` only does whole decks. `keynote_export_slide_image` marks every other slide skipped, exports with `skippedSlides: false`, then restores the original skip flags.
 - **Keynote stop slideshow**: JXA `app.stop(doc)` can return without stopping. Use AppleScript `stop document ...` and verify with `app.playing()`.
 - **Numbers auto-parses formatted strings**: Writing `"$1,234.56"` to a cell auto-converts to numeric 1234.56. To preserve strings, set `cell.format = "text"` before writing.
 - **Pages 15.x table creation broken**: `doc.tables.push()` AND AppleScript `make new table` both fail with -2763 "TMAScriptTableInfoProxy" (reading/resizing existing tables via AppleScript works). `pages_add_table` falls back to `pagesInsertTableViaUI()` in `src/jxa.ts` on Creator Studio: System Events menu-clicks Insert > Table > Basic, then resizes via AppleScript `set row count`/`set column count`. The insertion point is established by clicking into the body with a top-down position scan (a click on a table/image selects it and disables the menu). Synthetic keystrokes are deliberately avoided — secure keyboard entry from ANY app (e.g. a browser password field) silently blocks them, but not mouse/menu clicks. Menu clicks must be two-step (open parent menu, then click child) — direct 3-level submenu clicks silently no-op.

@@ -572,6 +572,81 @@ describe("Keynote Integration", async () => {
     }
   });
 
+  // ── Text boxes and items ──
+
+  it("adds, edits, formats, and deletes a text box", async () => {
+    const { json: added } = await call(ctx, "keynote_add_slide", { documentName: docName });
+    const slideNumber = added.slideNumber;
+
+    const { json: box, isError } = await call(ctx, "keynote_add_text_box", {
+      documentName: docName, slideNumber, text: "Free text", x: 100, y: 120, fontSize: 30, textColor: "#FF0000",
+    });
+    assert.ok(!isError && box.added);
+    assert.ok(Math.abs(box.x - 100) < 2 && Math.abs(box.y - 120) < 2);
+
+    const { json: info } = await call(ctx, "keynote_get_shape_info", {
+      documentName: docName, slideNumber, shapeIndex: box.textItemIndex, itemType: "textItem",
+    });
+    assert.equal(info.text, "Free text");
+    assert.equal(info.textFormat.size, 30);
+    // Keynote stores colors in its own color space, so they read back a few units off (#fb0207)
+    const rgb = (hex: string) => [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16));
+    rgb(info.textFormat.color).forEach((v, i) => assert.ok(Math.abs(v - rgb("#ff0000")[i]) <= 8, `color ${info.textFormat.color}`));
+
+    const { json: set } = await call(ctx, "keynote_set_item_text", {
+      documentName: docName, slideNumber, itemType: "textItem", itemIndex: box.textItemIndex, text: "Edited",
+    });
+    assert.equal(set.text, "Edited");
+
+    const { json: fmt } = await call(ctx, "keynote_format_shape", {
+      documentName: docName, slideNumber, shapeIndex: box.textItemIndex, itemType: "textItem",
+      format: { fontName: "HelveticaNeue-Bold" },
+    });
+    assert.deepEqual(fmt.applied, ["fontName"]);
+
+    const { json: del } = await call(ctx, "keynote_delete_item", {
+      documentName: docName, slideNumber, itemType: "textItem", itemIndex: box.textItemIndex,
+    });
+    assert.ok(del.deleted);
+    const { json: items } = await call(ctx, "keynote_list_slide_items", { documentName: docName, slideNumber });
+    assert.ok(!items.items.some((i: { text?: string }) => i.text === "Edited"));
+
+    await call(ctx, "keynote_delete_slide", { documentName: docName, slideNumber });
+  });
+
+  it("formats slide table cells, columns, and rows", async () => {
+    const { json: slides } = await call(ctx, "keynote_list_slides", { documentName: docName });
+    const { json: tbl } = await call(ctx, "keynote_add_table_to_slide", {
+      documentName: docName, slideNumber: slides.length, data: [["A", "B"], [1, 2]],
+    });
+    assert.ok(tbl.added);
+    const { json: items } = await call(ctx, "keynote_list_slide_items", { documentName: docName, slideNumber: slides.length });
+    const tableIndex = (items.items as Array<{ type: string }>).filter(i => i.type === "table").length - 1;
+    const { json, isError, text } = await call(ctx, "keynote_format_slide_table", {
+      documentName: docName, slideNumber: slides.length, tableIndex, cellRange: "A1:B1",
+      format: { backgroundColor: "#003366", textColor: "#FFFFFF", fontName: "HelveticaNeue-Bold", fontSize: 14, alignment: "center", columnWidth: 120, rowHeight: 40 },
+    });
+    assert.ok(!isError, text);
+    assert.deepEqual(json.applied, ["textColor", "backgroundColor", "fontName", "fontSize", "alignment", "columnWidth", "rowHeight"]);
+  });
+
+  it("exports a single slide as an image", async () => {
+    const result = await ctx.client.callTool({ name: "keynote_export_slide_image", arguments: { documentName: docName, slideNumber: 1, maxSize: 400 } });
+    assert.ok(!result.isError, JSON.stringify(result.content));
+    const [image, meta] = result.content as Array<{ type: string; data?: string; text?: string }>;
+    assert.equal(image.type, "image");
+    assert.ok(image.data!.startsWith("iVBOR"), "Should be a PNG");
+    const { path } = JSON.parse(meta.text!);
+    tmpFiles.push(path);
+  });
+
+  it("lists transition effects", async () => {
+    const { json, isError } = await call(ctx, "keynote_list_transition_effects");
+    assert.ok(!isError);
+    assert.ok(json.effects.includes("dissolve"));
+    assert.ok(json.effects.includes("no transition effect"));
+  });
+
   // ── Export to PDF ──
 
   it("exports to PDF", async () => {

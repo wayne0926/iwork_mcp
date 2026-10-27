@@ -1,5 +1,8 @@
 import { execFile } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
+import { copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -97,6 +100,18 @@ const ITEM_KEY_HELPER = `
           return [text, Math.round(p.x), Math.round(p.y), Math.round(item.width()), Math.round(item.height())].join("|");
         } catch (e) { return null; }
       }
+`;
+
+const TEXT_ITEM_TYPE = z.enum(["shape", "textItem"]).optional().describe("Item type: 'shape' (default) or 'textItem' (text box); indexes as in keynote_list_slide_items");
+
+// Expects slide, params.itemType and params.itemIndex
+const ITEM_LOOKUP = `
+      const collections = { shape: slide.shapes, textItem: slide.textItems, image: slide.images, table: slide.tables, line: slide.lines };
+      const itemList = collections[params.itemType]();
+      if (params.itemIndex >= itemList.length) {
+        throw new Error(params.itemType + " index " + params.itemIndex + " out of range (slide has " + itemList.length + ")");
+      }
+      const item = itemList[params.itemIndex];
 `;
 
 // Layouts like Blank/Quote hide the title/body placeholder; text written there is invisible
@@ -321,6 +336,68 @@ export function registerKeynoteTools(server: McpServer): void {
       return JSON.stringify({ exported: true, path: params.filePath, format: params.format });
     `, { documentName, filePath, format });
     }),
+  );
+
+  server.tool(
+    "keynote_export_slide_image",
+    "Render a single slide as a PNG and return the image, e.g. to check a slide after editing it",
+    {
+      documentName: z.string().describe("Name of the open presentation"),
+      slideNumber: z.number().int().min(1).describe("Slide number (1-based)"),
+      filePath: z.string().startsWith("/").regex(/\.png$/i).optional().describe("Where to save the PNG (default: a temporary file)"),
+      maxSize: z.number().int().min(64).optional().describe("Longest side in pixels; larger images are scaled down (default: 1280)"),
+    },
+    ANNOTATIONS.readWrite,
+    async ({ documentName, slideNumber, filePath, maxSize }) => {
+      try {
+        const workDir = await mkdtemp(join(filePath ? dirname(filePath) : tmpdir(), ".iwork-mcp-slide-"));
+        try {
+          // Keynote only exports whole decks, so skip every other slide for the export
+          await runJXA<void>(`
+      const app = Application("Keynote");
+      const doc = app.documents.byName(params.documentName);
+      const slides = doc.slides();
+      if (params.slideNumber > slides.length) {
+        throw new Error("Slide " + params.slideNumber + " is out of range (presentation has " + slides.length + " slides)");
+      }
+      const wasSkipped = slides.map(function (s) { return s.skipped(); });
+      try {
+        for (let i = 0; i < slides.length; i++) {
+          const skip = i !== params.slideNumber - 1;
+          if (wasSkipped[i] !== skip) slides[i].skipped = skip;
+        }
+        app.export(doc, { to: Path(params.folder), as: "slide images", withProperties: { skippedSlides: false } });
+      } finally {
+        for (let i = 0; i < slides.length; i++) {
+          if (slides[i].skipped() !== wasSkipped[i]) slides[i].skipped = wasSkipped[i];
+        }
+      }
+    `, { documentName, slideNumber, folder: join(workDir, "slide") }, { timeout: 60_000, label: "keynote_export_slide_image" });
+
+          const { stdout } = await execFileAsync("/usr/bin/find", [workDir, "-type", "f", "-iname", "*.png"]);
+          const image = stdout.split("\n").filter(Boolean)[0];
+          if (!image) throw new Error("Keynote did not export the slide image");
+          const limit = maxSize ?? 1280;
+          const dims = await execFileAsync("/usr/bin/sips", ["-g", "pixelWidth", "-g", "pixelHeight", image]);
+          const sizes = [...dims.stdout.matchAll(/pixel(?:Width|Height): (\d+)/g)].map(m => Number(m[1]));
+          if (Math.max(...sizes) > limit) await execFileAsync("/usr/bin/sips", ["-Z", String(limit), image]);
+
+          const target = filePath ?? join(tmpdir(), `keynote-slide-${slideNumber}-${Date.now()}.png`);
+          await copyFile(image, target);
+          const data = (await readFile(target)).toString("base64");
+          return {
+            content: [
+              { type: "image" as const, data, mimeType: "image/png" },
+              { type: "text" as const, text: JSON.stringify({ exported: true, slideNumber, path: target }) },
+            ],
+          };
+        } finally {
+          await rm(workDir, { recursive: true, force: true });
+        }
+      } catch (err) {
+        return toolResult(err instanceof Error ? err.message : String(err), true);
+      }
+    },
   );
 
   server.tool(
@@ -842,6 +919,102 @@ export function registerKeynoteTools(server: McpServer): void {
   );
 
   server.tool(
+    "keynote_add_text_box",
+    "Add a free text box to a slide",
+    {
+      documentName: z.string().describe("Name of the open presentation"),
+      slideNumber: z.number().int().min(1).describe("Slide number (1-based)"),
+      text: z.string().describe("Text content (newlines start new paragraphs)"),
+      x: z.number().optional().describe("X position in points"),
+      y: z.number().optional().describe("Y position in points"),
+      width: z.number().positive().optional().describe("Width in points"),
+      height: z.number().positive().optional().describe("Height in points"),
+      fontName: z.string().optional().describe("PostScript font name (e.g. 'HelveticaNeue-Bold')"),
+      fontSize: z.number().positive().optional().describe("Font size in points"),
+      textColor: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional().describe("Text color as hex, e.g. '#FFFFFF'"),
+    },
+    ANNOTATIONS.readWrite,
+    async ({ documentName, slideNumber, text, x, y, width, height, fontName, fontSize, textColor }) => handleJXA(() => runJXA<string>(`
+      ${SLIDE_LOOKUP}
+      ${ITEM_KEY_HELPER}
+      function keysOf(items) {
+        return items.map(function (t) { let text = ""; try { text = t.objectText(); } catch (e) {} return itemKey(t, text); });
+      }
+      const beforeKeys = keysOf(slide.textItems());
+      slide.textItems.push(app.TextItem({ objectText: params.text }));
+      const items = slide.textItems();
+      if (items.length !== beforeKeys.length + 1) throw new Error("Text box was not added");
+      // The new box isn't necessarily last (Keynote can insert it before hidden placeholders):
+      // it's the first item whose text + geometry occurs more often than before
+      const remaining = {};
+      beforeKeys.forEach(function (k) { remaining[k] = (remaining[k] || 0) + 1; });
+      const index = keysOf(items).findIndex(function (k) {
+        if (remaining[k]) { remaining[k]--; return false; }
+        return true;
+      });
+      const box = items[index];
+      if (params.width !== null) box.width = params.width;
+      if (params.height !== null) box.height = params.height;
+      if (params.fontName !== null) box.objectText.font = params.fontName;
+      if (params.fontSize !== null) box.objectText.size = params.fontSize;
+      if (params.textColor !== null) {
+        const hex = params.textColor;
+        box.objectText.color = [parseInt(hex.slice(1, 3), 16) * 257, parseInt(hex.slice(3, 5), 16) * 257, parseInt(hex.slice(5, 7), 16) * 257];
+      }
+      // Last: a font change resizes the box and Keynote keeps it centered
+      if (params.x !== null || params.y !== null) {
+        const cur = box.position();
+        box.position = { x: params.x !== null ? params.x : cur.x, y: params.y !== null ? params.y : cur.y };
+      }
+      const p = box.position();
+      return JSON.stringify({ added: true, slideNumber: params.slideNumber, textItemIndex: index, x: p.x, y: p.y, width: box.width(), height: box.height() });
+    `, {
+      documentName, slideNumber, text, x: x ?? null, y: y ?? null, width: width ?? null, height: height ?? null,
+      fontName: fontName ?? null, fontSize: fontSize ?? null, textColor: textColor ?? null,
+    })),
+  );
+
+  server.tool(
+    "keynote_set_item_text",
+    "Replace the text of a text box or shape on a slide, including layout placeholders such as a quote or attribution (use keynote_list_slide_items to find the index)",
+    {
+      documentName: z.string().describe("Name of the open presentation"),
+      slideNumber: z.number().int().min(1).describe("Slide number (1-based)"),
+      itemType: z.enum(["shape", "textItem"]).describe("Item type"),
+      itemIndex: z.number().int().min(0).describe("Item index (0-based)"),
+      text: z.string().describe("New text (newlines start new paragraphs)"),
+    },
+    ANNOTATIONS.readWrite,
+    async ({ documentName, slideNumber, itemType, itemIndex, text }) => handleJXA(() => runJXA<string>(`
+      ${SLIDE_LOOKUP}
+      ${ITEM_LOOKUP}
+      item.objectText = params.text;
+      return JSON.stringify({ set: true, slideNumber: params.slideNumber, itemType: params.itemType, itemIndex: params.itemIndex, text: item.objectText() });
+    `, { documentName, slideNumber, itemType, itemIndex, text })),
+  );
+
+  server.tool(
+    "keynote_delete_item",
+    "Delete an item (shape, text box, image, table, or line) from a slide (use keynote_list_slide_items to find the index)",
+    {
+      documentName: z.string().describe("Name of the open presentation"),
+      slideNumber: z.number().int().min(1).describe("Slide number (1-based)"),
+      itemType: z.enum(["shape", "textItem", "image", "table", "line"]).describe("Item type"),
+      itemIndex: z.number().int().min(0).describe("Item index (0-based)"),
+    },
+    ANNOTATIONS.destructive,
+    async ({ documentName, slideNumber, itemType, itemIndex }) => handleJXA(() => runJXA<string>(`
+      ${SLIDE_LOOKUP}
+      ${ITEM_LOOKUP}
+      const before = itemList.length;
+      app.delete(item);
+      const after = collections[params.itemType]().length;
+      if (after >= before) throw new Error("Item was not deleted");
+      return JSON.stringify({ deleted: true, slideNumber: params.slideNumber, itemType: params.itemType, itemIndex: params.itemIndex });
+    `, { documentName, slideNumber, itemType, itemIndex })),
+  );
+
+  server.tool(
     "keynote_add_line",
     "Add a line to a slide between two points",
     {
@@ -922,6 +1095,18 @@ export function registerKeynoteTools(server: McpServer): void {
         throw err;
       }
     }),
+  );
+
+  server.tool(
+    "keynote_list_transition_effects",
+    "List the transition effect names keynote_set_transition accepts (read from Keynote's scripting dictionary)",
+    {},
+    ANNOTATIONS.readOnly,
+    async () => {
+      const names = await keynoteTransitionEffects();
+      if (!names.length) return toolResult("Could not read the transition effects from Keynote's scripting dictionary", true);
+      return toolResult(JSON.stringify({ effects: names, note: "'none' is accepted as an alias for 'no transition effect'" }, null, 2));
+    },
   );
 
   server.tool(
@@ -1108,22 +1293,18 @@ export function registerKeynoteTools(server: McpServer): void {
 
   server.tool(
     "keynote_get_shape_info",
-    "Read shape properties: position, size, text, opacity, rotation, and text formatting",
+    "Read shape or text box properties: position, size, text, opacity, rotation, and text formatting",
     {
       documentName: z.string().describe("Name of the open presentation"),
       slideNumber: z.number().int().min(1).describe("Slide number (1-based)"),
-      shapeIndex: z.number().int().min(0).describe("Shape index (0-based)"),
+      shapeIndex: z.number().int().min(0).describe("Item index (0-based)"),
+      itemType: TEXT_ITEM_TYPE,
     },
     ANNOTATIONS.readOnly,
-    async ({ documentName, slideNumber, shapeIndex }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Keynote");
-      const doc = app.documents.byName(params.documentName);
-      const slide = doc.slides[params.slideNumber - 1];
-      const shapes = slide.shapes();
-      if (params.shapeIndex >= shapes.length) {
-        throw new Error("Shape index " + params.shapeIndex + " out of range (slide has " + shapes.length + " shapes)");
-      }
-      const shape = shapes[params.shapeIndex];
+    async ({ documentName, slideNumber, shapeIndex, itemType }) => handleJXA(() => runJXA<string>(`
+      ${SLIDE_LOOKUP}
+      ${ITEM_LOOKUP}
+      const shape = item;
 
       const info = {};
       try { info.position = shape.position(); } catch(e) {}
@@ -1148,16 +1329,17 @@ export function registerKeynoteTools(server: McpServer): void {
       } catch(e) {}
 
       return JSON.stringify(info);
-    `, { documentName, slideNumber, shapeIndex })),
+    `, { documentName, slideNumber, itemIndex: shapeIndex, itemType: itemType ?? "shape" })),
   );
 
   server.tool(
     "keynote_format_shape",
-    "Set shape properties: opacity, rotation, and text formatting (font, size, color). Note: fill and border colors and text alignment are not accessible via scripting.",
+    "Set shape or text box properties: opacity, rotation, and text formatting (font, size, color; use a bold PostScript font name for bold). Note: fill and border colors and text alignment are not accessible via scripting.",
     {
       documentName: z.string().describe("Name of the open presentation"),
       slideNumber: z.number().int().min(1).describe("Slide number (1-based)"),
-      shapeIndex: z.number().int().min(0).describe("Shape index (0-based)"),
+      shapeIndex: z.number().int().min(0).describe("Item index (0-based)"),
+      itemType: TEXT_ITEM_TYPE,
       format: z.object({
         opacity: z.number().min(0).max(100).optional().describe("Opacity (0-100)"),
         rotation: z.number().optional().describe("Rotation in degrees"),
@@ -1167,15 +1349,10 @@ export function registerKeynoteTools(server: McpServer): void {
       }).strict().describe("Format options"),
     },
     ANNOTATIONS.readWrite,
-    async ({ documentName, slideNumber, shapeIndex, format }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Keynote");
-      const doc = app.documents.byName(params.documentName);
-      const slide = doc.slides[params.slideNumber - 1];
-      const shapes = slide.shapes();
-      if (params.shapeIndex >= shapes.length) {
-        throw new Error("Shape index " + params.shapeIndex + " out of range (slide has " + shapes.length + " shapes)");
-      }
-      const shape = shapes[params.shapeIndex];
+    async ({ documentName, slideNumber, shapeIndex, itemType, format }) => handleJXA(() => runJXA<string>(`
+      ${SLIDE_LOOKUP}
+      ${ITEM_LOOKUP}
+      const shape = item;
       const fmt = params.format;
 
       // No rollback: report what already took effect
@@ -1206,8 +1383,8 @@ export function registerKeynoteTools(server: McpServer): void {
         }
       });
 
-      return JSON.stringify({ formatted: true, shapeIndex: params.shapeIndex, applied: applied });
-    `, { documentName, slideNumber, shapeIndex, format })),
+      return JSON.stringify({ formatted: true, shapeIndex: params.itemIndex, applied: applied });
+    `, { documentName, slideNumber, itemIndex: shapeIndex, itemType: itemType ?? "shape", format })),
   );
 
   // ── Slide Table Tools ──
@@ -1340,7 +1517,7 @@ export function registerKeynoteTools(server: McpServer): void {
 
   server.tool(
     "keynote_format_slide_table",
-    "Format cells in a table on a slide (text color, number format)",
+    "Format cells in a table on a slide: text and background color, font (use a bold PostScript font name for bold), size, alignment, number format, and the width/height of the columns/rows in the range. The currency symbol can't be chosen via scripting.",
     {
       documentName: z.string().describe("Name of the open presentation"),
       slideNumber: z.number().int().min(1).describe("Slide number (1-based)"),
@@ -1348,14 +1525,19 @@ export function registerKeynoteTools(server: McpServer): void {
       cellRange: z.string().regex(/^[A-Z]{1,3}\d+(?::[A-Z]{1,3}\d+)?$/).describe("Cell or range reference, e.g. 'A1' or 'A1:C3'"),
       format: z.object({
         textColor: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional().describe("Text color as hex, e.g. '#FF0000'"),
+        backgroundColor: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional().describe("Cell background color as hex"),
+        fontName: z.string().optional().describe("PostScript font name, e.g. 'HelveticaNeue-Bold'"),
+        fontSize: z.number().positive().optional().describe("Font size in points"),
+        alignment: z.enum(["left", "center", "right", "justify"]).optional().describe("Horizontal text alignment"),
+        verticalAlignment: z.enum(["top", "center", "bottom"]).optional().describe("Vertical text alignment"),
         numberFormat: z.enum(["automatic", "number", "currency", "percent", "fraction", "scientific", "text"]).optional().describe("Number format for the cells"),
-      }).describe("Formatting options to apply"),
+        columnWidth: z.number().positive().optional().describe("Width in points for every column in the range"),
+        rowHeight: z.number().positive().optional().describe("Height in points for every row in the range"),
+      }).strict().describe("Formatting options to apply"),
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, slideNumber, tableIndex, cellRange, format }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Keynote");
-      const doc = app.documents.byName(params.documentName);
-      const slide = doc.slides[params.slideNumber - 1];
+      ${SLIDE_LOOKUP}
       const tables = slide.tables();
       const idx = params.tableIndex || 0;
       if (idx >= tables.length) {
@@ -1379,22 +1561,45 @@ export function registerKeynoteTools(server: McpServer): void {
       } else {
         cells.push(range);
       }
-      var formatted = 0;
-      for (var i = 0; i < cells.length; i++) {
-        var cell = tbl.cells[cells[i]];
-        if (params.format.textColor) {
-          var hex = params.format.textColor;
-          var r = parseInt(hex.slice(1,3), 16) * 257;
-          var g = parseInt(hex.slice(3,5), 16) * 257;
-          var b = parseInt(hex.slice(5,7), 16) * 257;
-          cell.textColor = [r, g, b];
-        }
-        if (params.format.numberFormat) {
-          cell.format = params.format.numberFormat;
-        }
-        formatted++;
+      const fmt = params.format;
+      function rgb(hex) {
+        return [parseInt(hex.slice(1,3), 16) * 257, parseInt(hex.slice(3,5), 16) * 257, parseInt(hex.slice(5,7), 16) * 257];
       }
-      return JSON.stringify({ formatted: true, cellsFormatted: formatted });
+      const cellProps = {
+        textColor: fmt.textColor && rgb(fmt.textColor),
+        backgroundColor: fmt.backgroundColor && rgb(fmt.backgroundColor),
+        fontName: fmt.fontName,
+        fontSize: fmt.fontSize,
+        alignment: fmt.alignment,
+        verticalAlignment: fmt.verticalAlignment,
+        format: fmt.numberFormat,
+      };
+      // No rollback: report what already took effect
+      const applied = [];
+      function apply(name, fn) {
+        try { fn(); } catch (e) {
+          throw new Error("Failed to set " + name + ": " + e.message + (applied.length ? " (already applied: " + applied.join(", ") + ")" : ""));
+        }
+        applied.push(name);
+      }
+      Object.keys(cellProps).forEach(function (prop) {
+        if (cellProps[prop] === undefined) return;
+        apply(prop === "format" ? "numberFormat" : prop, function () {
+          for (var i = 0; i < cells.length; i++) tbl.cells[cells[i]][prop] = cellProps[prop];
+        });
+      });
+      var refs = range.split(":");
+      var firstCol = refs[0].replace(/[0-9]/g, "").charCodeAt(0) - 65;
+      var lastCol = refs[refs.length - 1].replace(/[0-9]/g, "").charCodeAt(0) - 65;
+      var firstRow = parseInt(refs[0].replace(/[A-Z]/g, ""), 10) - 1;
+      var lastRow = parseInt(refs[refs.length - 1].replace(/[A-Z]/g, ""), 10) - 1;
+      if (fmt.columnWidth !== undefined) apply("columnWidth", function () {
+        for (var c = firstCol; c <= lastCol; c++) tbl.columns[c].width = fmt.columnWidth;
+      });
+      if (fmt.rowHeight !== undefined) apply("rowHeight", function () {
+        for (var r = firstRow; r <= lastRow; r++) tbl.rows[r].height = fmt.rowHeight;
+      });
+      return JSON.stringify({ formatted: true, cellsFormatted: cells.length, applied: applied });
     `, { documentName, slideNumber, tableIndex: tableIndex ?? 0, cellRange, format })),
   );
 
