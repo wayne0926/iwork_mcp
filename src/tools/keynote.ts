@@ -104,14 +104,19 @@ const ITEM_KEY_HELPER = `
 
 const TEXT_ITEM_TYPE = z.enum(["shape", "textItem"]).optional().describe("Item type: 'shape' (default) or 'textItem' (text box); indexes as in keynote_list_slide_items");
 
-// Expects slide, params.itemType and params.itemIndex
+// Expects slide, params.itemType and params.itemIndex. Locked items ignore deletes and fail edits with -10003.
 const ITEM_LOOKUP = `
-      const collections = { shape: slide.shapes, textItem: slide.textItems, image: slide.images, table: slide.tables, line: slide.lines };
+      const collections = { shape: slide.shapes, textItem: slide.textItems, image: slide.images, table: slide.tables, line: slide.lines, chart: slide.charts };
       const itemList = collections[params.itemType]();
       if (params.itemIndex >= itemList.length) {
         throw new Error(params.itemType + " index " + params.itemIndex + " out of range (slide has " + itemList.length + ")");
       }
       const item = itemList[params.itemIndex];
+      function assertUnlocked() {
+        let locked = false;
+        try { locked = item.locked(); } catch (e) {}
+        if (locked) throw new Error(params.itemType + " " + params.itemIndex + " is locked; unlock it first with keynote_set_item_locked");
+      }
 `;
 
 // Layouts like Blank/Quote hide the title/body placeholder; text written there is invisible
@@ -528,7 +533,7 @@ export function registerKeynoteTools(server: McpServer): void {
 
   server.tool(
     "keynote_list_slide_items",
-    "List all items on a slide with their types, positions, and sizes",
+    "List all items on a slide (shapes, text boxes, images, tables, lines, charts) with their types, positions, sizes, and whether they are locked",
     {
       documentName: z.string().describe("Name of the open presentation"),
       slideNumber: z.number().int().min(1).describe("Slide number (1-based)"),
@@ -543,12 +548,16 @@ export function registerKeynoteTools(server: McpServer): void {
       function pos(item) {
         try { var p = item.position(); return { x: p.x || p[0] || 0, y: p.y || p[1] || 0 }; } catch(e) { return null; }
       }
+      function markLocked(item, entry) {
+        try { if (item.locked()) entry.locked = true; } catch(e) {}
+        return entry;
+      }
 
       try {
         var shapes = slide.shapes();
         for (var i = 0; i < shapes.length; i++) {
           var s = shapes[i];
-          var entry = { type: "shape", index: i, width: s.width(), height: s.height(), position: pos(s) };
+          var entry = markLocked(s, { type: "shape", index: i, width: s.width(), height: s.height(), position: pos(s) });
           try { entry.text = s.objectText(); } catch(e) {}
           var key = itemKey(s, entry.text);
           if (key !== null) {
@@ -563,7 +572,7 @@ export function registerKeynoteTools(server: McpServer): void {
         var textItems = slide.textItems();
         for (var i = 0; i < textItems.length; i++) {
           var t = textItems[i];
-          var entry = { type: "textItem", index: i, width: t.width(), height: t.height(), position: pos(t) };
+          var entry = markLocked(t, { type: "textItem", index: i, width: t.width(), height: t.height(), position: pos(t) });
           try { entry.text = t.objectText(); } catch(e) {}
           var key = itemKey(t, entry.text);
           if (key !== null) {
@@ -582,7 +591,7 @@ export function registerKeynoteTools(server: McpServer): void {
         var images = slide.images();
         for (var i = 0; i < images.length; i++) {
           var img = images[i];
-          items.push({ type: "image", index: i, width: img.width(), height: img.height(), position: pos(img) });
+          items.push(markLocked(img, { type: "image", index: i, width: img.width(), height: img.height(), position: pos(img) }));
         }
       } catch(e) {}
 
@@ -590,7 +599,7 @@ export function registerKeynoteTools(server: McpServer): void {
         var tables = slide.tables();
         for (var i = 0; i < tables.length; i++) {
           var tbl = tables[i];
-          items.push({ type: "table", index: i, name: tbl.name(), rows: tbl.rowCount(), columns: tbl.columnCount(), width: tbl.width(), height: tbl.height(), position: pos(tbl) });
+          items.push(markLocked(tbl, { type: "table", index: i, name: tbl.name(), rows: tbl.rowCount(), columns: tbl.columnCount(), width: tbl.width(), height: tbl.height(), position: pos(tbl) }));
         }
       } catch(e) {}
 
@@ -598,7 +607,15 @@ export function registerKeynoteTools(server: McpServer): void {
         var lines = slide.lines();
         for (var i = 0; i < lines.length; i++) {
           var ln = lines[i];
-          items.push({ type: "line", index: i, startPoint: ln.startPoint(), endPoint: ln.endPoint() });
+          items.push(markLocked(ln, { type: "line", index: i, startPoint: ln.startPoint(), endPoint: ln.endPoint() }));
+        }
+      } catch(e) {}
+
+      try {
+        var charts = slide.charts();
+        for (var i = 0; i < charts.length; i++) {
+          var ch = charts[i];
+          items.push(markLocked(ch, { type: "chart", index: i, width: ch.width(), height: ch.height(), position: pos(ch) }));
         }
       } catch(e) {}
 
@@ -988,6 +1005,7 @@ export function registerKeynoteTools(server: McpServer): void {
     async ({ documentName, slideNumber, itemType, itemIndex, text }) => handleJXA(() => runJXA<string>(`
       ${SLIDE_LOOKUP}
       ${ITEM_LOOKUP}
+      assertUnlocked();
       item.objectText = params.text;
       return JSON.stringify({ set: true, slideNumber: params.slideNumber, itemType: params.itemType, itemIndex: params.itemIndex, text: item.objectText() });
     `, { documentName, slideNumber, itemType, itemIndex, text })),
@@ -995,23 +1013,242 @@ export function registerKeynoteTools(server: McpServer): void {
 
   server.tool(
     "keynote_delete_item",
-    "Delete an item (shape, text box, image, table, or line) from a slide (use keynote_list_slide_items to find the index)",
+    "Delete an item (shape, text box, image, table, line, or chart) from a slide (use keynote_list_slide_items to find the index). Locked items must be unlocked first (keynote_set_item_locked).",
     {
       documentName: z.string().describe("Name of the open presentation"),
       slideNumber: z.number().int().min(1).describe("Slide number (1-based)"),
-      itemType: z.enum(["shape", "textItem", "image", "table", "line"]).describe("Item type"),
+      itemType: z.enum(["shape", "textItem", "image", "table", "line", "chart"]).describe("Item type"),
       itemIndex: z.number().int().min(0).describe("Item index (0-based)"),
     },
     ANNOTATIONS.destructive,
     async ({ documentName, slideNumber, itemType, itemIndex }) => handleJXA(() => runJXA<string>(`
       ${SLIDE_LOOKUP}
       ${ITEM_LOOKUP}
+      assertUnlocked();
       const before = itemList.length;
       app.delete(item);
       const after = collections[params.itemType]().length;
       if (after >= before) throw new Error("Item was not deleted");
       return JSON.stringify({ deleted: true, slideNumber: params.slideNumber, itemType: params.itemType, itemIndex: params.itemIndex });
     `, { documentName, slideNumber, itemType, itemIndex })),
+  );
+
+  server.tool(
+    "keynote_set_item_locked",
+    "Lock or unlock an item on a slide. Locked items can't be moved, edited, or deleted until unlocked.",
+    {
+      documentName: z.string().describe("Name of the open presentation"),
+      slideNumber: z.number().int().min(1).describe("Slide number (1-based)"),
+      itemType: z.enum(["shape", "textItem", "image", "table", "line", "chart"]).describe("Item type"),
+      itemIndex: z.number().int().min(0).describe("Item index (0-based)"),
+      locked: z.boolean().describe("True to lock, false to unlock"),
+    },
+    ANNOTATIONS.readWrite,
+    async ({ documentName, slideNumber, itemType, itemIndex, locked }) => handleJXA(() => runJXA<string>(`
+      ${SLIDE_LOOKUP}
+      ${ITEM_LOOKUP}
+      item.locked = params.locked;
+      return JSON.stringify({ slideNumber: params.slideNumber, itemType: params.itemType, itemIndex: params.itemIndex, locked: item.locked() });
+    `, { documentName, slideNumber, itemType, itemIndex, locked })),
+  );
+
+  server.tool(
+    "keynote_add_chart",
+    "Add a native Keynote chart to a slide. data[r][c] is the value for row r and column c. groupBy 'row' (default): each row is one series (one line/bar color) and the column names label the x-axis; 'column': each column is a series and the row names go on the x-axis. Keynote's scripting can't add a legend or chart title — add a text box for that.",
+    {
+      documentName: z.string().describe("Name of the open presentation"),
+      slideNumber: z.number().int().min(1).describe("Slide number (1-based)"),
+      chartType: z.enum([
+        "vertical_bar_2d", "stacked_vertical_bar_2d", "horizontal_bar_2d", "stacked_horizontal_bar_2d",
+        "line_2d", "area_2d", "stacked_area_2d", "pie_2d", "scatterplot_2d",
+        "vertical_bar_3d", "stacked_vertical_bar_3d", "horizontal_bar_3d", "stacked_horizontal_bar_3d",
+        "line_3d", "area_3d", "stacked_area_3d", "pie_3d",
+      ]).optional().describe("Chart type (default: vertical_bar_2d)"),
+      rowNames: z.array(z.string()).min(1).describe("Row labels, one per data row"),
+      columnNames: z.array(z.string()).min(1).describe("Column labels, one per data column"),
+      data: z.array(z.array(z.number())).min(1).describe("Values as rows x columns"),
+      groupBy: z.enum(["row", "column"]).optional().describe("Whether rows or columns form the data series (default: row)"),
+      x: z.number().optional().describe("X position in points"),
+      y: z.number().optional().describe("Y position in points"),
+      width: z.number().positive().optional().describe("Width in points"),
+      height: z.number().positive().optional().describe("Height in points"),
+    },
+    ANNOTATIONS.readWrite,
+    async ({ documentName, slideNumber, chartType, rowNames, columnNames, data, groupBy, x, y, width, height }) => {
+      if (data.length !== rowNames.length || data.some(row => row.length !== columnNames.length)) {
+        return toolResult(`data needs one row per row name (${rowNames.length}) and one value per column name (${columnNames.length})`, true);
+      }
+      return handleJXA(() => runJXA<string>(`
+      ${KEYNOTE_AS_HELPERS}
+      ${SLIDE_LOOKUP}
+      const before = slide.charts.length;
+      const list = function (values) { return "{" + values.map(function (v) { return typeof v === "number" ? String(v) : asQuote(v); }).join(", ") + "}"; };
+      runAS('tell application "Keynote" to add chart slide ' + params.slideNumber + ' of ' + docRef() +
+        ' row names ' + list(params.rowNames) + ' column names ' + list(params.columnNames) +
+        ' data {' + params.data.map(list).join(", ") + '}' +
+        ' type ' + params.chartType + ' group by ' + (params.groupBy === "column" ? "chart column" : "chart row"));
+      if (slide.charts.length !== before + 1) throw new Error("Chart was not added");
+      const chart = slide.charts[slide.charts.length - 1];
+      if (params.width !== null) chart.width = params.width;
+      if (params.height !== null) chart.height = params.height;
+      if (params.x !== null || params.y !== null) {
+        const cur = chart.position();
+        chart.position = { x: params.x !== null ? params.x : cur.x, y: params.y !== null ? params.y : cur.y };
+      }
+      const p = chart.position();
+      return JSON.stringify({ added: true, slideNumber: params.slideNumber, chartIndex: slide.charts.length - 1, x: p.x, y: p.y, width: chart.width(), height: chart.height() });
+    `, {
+        documentName, slideNumber, chartType: chartType ?? "vertical_bar_2d", rowNames, columnNames, data, groupBy: groupBy ?? "row",
+        x: x ?? null, y: y ?? null, width: width ?? null, height: height ?? null,
+      }));
+    },
+  );
+
+  server.tool(
+    "keynote_add_image_slides",
+    "Add one new slide per image file at the end of the presentation (removes the duplicate slides Keynote 15.4 creates)",
+    {
+      documentName: z.string().describe("Name of the open presentation"),
+      filePaths: z.array(z.string().startsWith("/")).min(1).describe("Absolute paths to the image files, in slide order"),
+      setTitles: z.boolean().optional().describe("Use each file name as the slide title (default: false)"),
+      masterSlideName: z.string().optional().describe("Slide layout for the new slides (default: the layout Keynote last used for image slides)"),
+    },
+    ANNOTATIONS.readWrite,
+    async ({ documentName, filePaths, setTitles, masterSlideName }) => {
+      const missing = filePaths.filter(p => !existsSync(p));
+      if (missing.length) return toolResult(`File not found: ${missing.join(", ")}`, true);
+      return handleJXA(() => runJXA<string>(`
+      ${KEYNOTE_AS_HELPERS}
+      ${PLACEHOLDER_HELPER}
+      const app = Application("Keynote");
+      const doc = app.documents.byName(params.documentName);
+      const before = doc.slides.length;
+      const originalCurrent = doc.currentSlide().slideNumber();
+      function setCurrent(n) { runAS('tell application "Keynote" to set current slide of ' + docRef() + ' to slide ' + n + ' of ' + docRef()); }
+
+      function baseName(p) { return String(p).split("/").pop(); }
+      function stem(n) { return n.replace(/\\.[^.]*$/, ""); }
+      // Keynote may rename an imported copy (e.g. "photo 2.png"): match on the file stem
+      function fileFor(imageName) {
+        return Object.keys(wanted).find(function (k) {
+          return stem(imageName) === stem(k) || stem(imageName).indexOf(stem(k)) === 0;
+        });
+      }
+      const wanted = {};
+      params.filePaths.forEach(function (p) { const n = baseName(p); wanted[n] = (wanted[n] || 0) + 1; });
+
+      let total = before, extra = [];
+      const hiddenTitles = [], resizedForTitle = [], coveredTitles = [];
+
+      // Photo layouts can stretch the image over the title, and scripting can't reorder layers:
+      // shrink the image into the larger free band above or below the title, keeping its proportions
+      function fitBesideTitle(image, title) {
+        const ip = image.position(), iw = image.width(), ih = image.height();
+        let tp = title.position(), th = title.height();
+        const tw = title.width();
+        // Title boxes are often far taller than one line of text: shrink the box to the text first,
+        // keeping the edge away from the image's center so the freed space joins the image's side
+        try {
+          const size = title.objectText.paragraphs[0].size();
+          const perLine = Math.max(1, Math.floor((tw - 20) / (size * 0.55)));
+          const lines = title.objectText().split(/\\r|\\n/).reduce(function (n, para) {
+            return n + Math.max(1, Math.ceil(para.length / perLine));
+          }, 0);
+          const needed = Math.ceil(lines * size * 1.25 + 20);
+          if (needed < th) {
+            const y = tp.y + th / 2 >= ip.y + ih / 2 ? tp.y + th - needed : tp.y;
+            title.height = needed;
+            title.position = { x: tp.x, y: y };
+            tp = { x: tp.x, y: y };
+            th = needed;
+          }
+        } catch (e) {}
+        const overlaps = tp.y < ip.y + ih && tp.y + th > ip.y && tp.x < ip.x + iw && tp.x + tw > ip.x;
+        if (!overlaps) return "clear";
+        const gap = 10;
+        const above = { top: ip.y, height: tp.y - gap - ip.y };
+        const below = { top: tp.y + th + gap, height: ip.y + ih - (tp.y + th + gap) };
+        const band = above.height >= below.height ? above : below;
+        if (band.height < ih / 4) return "covered";
+        const scale = band.height / ih;
+        const w = Math.round(iw * scale), h = Math.round(band.height);
+        image.width = w;
+        image.height = h;
+        image.position = { x: Math.round(ip.x + (iw - w) / 2), y: Math.round(band.top) };
+        return "resized";
+      }
+      try {
+        // New slides go after the current slide: make that the last one
+        setCurrent(before);
+        let src = 'set fileList to {' + params.filePaths.map(function (p) { return "POSIX file " + asQuote(p); }).join(", ") + '}\\n' +
+          'tell application "Keynote" to make image slides ' + docRef() + ' files fileList set titles ' + (params.setTitles ? "true" : "false");
+        if (params.masterSlideName) src += ' slide layout (slide layout ' + asQuote(params.masterSlideName) + ' of ' + docRef() + ')';
+        runAS(src);
+
+        // Keynote 15.4 creates every image slide twice. Keep as many slides per file as requested.
+        // Photo layouts also bring a sample image of their own, which is removed.
+        const after = doc.slides.length;
+        const kept = [];
+        for (let n = before + 1; n <= after; n++) {
+          const slide = doc.slides[n - 1];
+          let file = null;
+          const samples = [];
+          slide.images().forEach(function (img) {
+            let name = "";
+            try { name = baseName(img.fileName()); } catch (e) {}
+            const match = name && fileFor(name);
+            if (match && !file) file = match; else samples.push(img);
+          });
+          if (!file) {
+            throw new Error("Slide " + n + " is not one of the new image slides; Keynote inserted them elsewhere (slides " + before + " -> " + after + ")");
+          }
+          if (wanted[file] > 0) {
+            wanted[file]--;
+            kept.push({ n: n, file: file, samples: samples });
+          } else {
+            extra.push(n);
+          }
+        }
+        kept.forEach(function (k) {
+          k.samples.forEach(function (img) { try { app.delete(img); } catch (e) {} });
+        });
+        for (let i = extra.length - 1; i >= 0; i--) app.delete(doc.slides[extra[i] - 1]);
+        total = doc.slides.length;
+        if (total !== before + params.filePaths.length) {
+          throw new Error("Expected " + params.filePaths.length + " new slides, got " + (total - before));
+        }
+
+        // Some layouts hide the title or leave it empty, so file-name titles wouldn't show
+        if (params.setTitles) {
+          kept.forEach(function (k, i) {
+            const n = before + i + 1;
+            const slide = doc.slides[n - 1];
+            try {
+              showPlaceholder(slide, n, "titleShowing", "title");
+              const title = slide.defaultTitleItem();
+              if (!title.objectText()) title.objectText = stem(k.file);
+              const image = slide.images().find(function (img) {
+                try { return fileFor(baseName(img.fileName())) === k.file; } catch (e) { return false; }
+              });
+              if (image) {
+                const fit = fitBesideTitle(image, title);
+                if (fit === "resized") resizedForTitle.push(n);
+                else if (fit === "covered") coveredTitles.push(n);
+              }
+            } catch (e) { hiddenTitles.push(n); }
+          });
+        }
+      } finally {
+        try { setCurrent(originalCurrent); } catch (e) {}
+      }
+
+      const result = { added: params.filePaths.length, firstSlideNumber: before + 1, totalSlides: total, duplicatesRemoved: extra.length };
+      if (hiddenTitles.length) result.titlesHiddenOnSlides = hiddenTitles;
+      if (resizedForTitle.length) result.imagesShrunkToShowTitleOnSlides = resizedForTitle;
+      if (coveredTitles.length) result.titlesCoveredByImageOnSlides = coveredTitles;
+      return JSON.stringify(result);
+    `, { documentName, filePaths, setTitles: setTitles ?? false, masterSlideName: masterSlideName ?? null }));
+    },
   );
 
   server.tool(
@@ -1134,11 +1371,11 @@ export function registerKeynoteTools(server: McpServer): void {
 
   server.tool(
     "keynote_position_item",
-    "Move and/or resize an item (shape, image, or textItem) on a slide by type and index",
+    "Move and/or resize an item (shape, image, textItem, table, chart, or line) on a slide by type and index",
     {
       documentName: z.string().describe("Name of the open presentation"),
       slideNumber: z.number().int().min(1).describe("Slide number (1-based)"),
-      itemType: z.enum(["shape", "image", "textItem"]).describe("Type of item"),
+      itemType: z.enum(["shape", "image", "textItem", "table", "chart", "line"]).describe("Type of item"),
       itemIndex: z.number().int().min(0).describe("Item index (0-based)"),
       x: z.number().optional().describe("New X position in points"),
       y: z.number().optional().describe("New Y position in points"),
@@ -1147,24 +1384,18 @@ export function registerKeynoteTools(server: McpServer): void {
     },
     ANNOTATIONS.readWrite,
     async ({ documentName, slideNumber, itemType, itemIndex, x, y, width, height }) => handleJXA(() => runJXA<string>(`
-      const app = Application("Keynote");
-      const doc = app.documents.byName(params.documentName);
-      const slide = doc.slides[params.slideNumber - 1];
+      ${SLIDE_LOOKUP}
+      ${ITEM_LOOKUP}
+      assertUnlocked();
 
-      const collections = { shape: slide.shapes, image: slide.images, textItem: slide.textItems };
-      const items = collections[params.itemType]();
-      if (params.itemIndex >= items.length) {
-        throw new Error(params.itemType + " index " + params.itemIndex + " out of range (slide has " + items.length + ")");
-      }
-      const item = items[params.itemIndex];
+      // Size first, so the requested position holds even if Keynote re-centers on resize
+      if (params.width !== null) item.width = params.width;
+      if (params.height !== null) item.height = params.height;
 
       const pos = item.position();
       const newX = params.x !== null ? params.x : pos.x;
       const newY = params.y !== null ? params.y : pos.y;
       item.position = {x: newX, y: newY};
-
-      if (params.width !== null) item.width = params.width;
-      if (params.height !== null) item.height = params.height;
 
       return JSON.stringify({
         positioned: true,
@@ -1352,6 +1583,7 @@ export function registerKeynoteTools(server: McpServer): void {
     async ({ documentName, slideNumber, shapeIndex, itemType, format }) => handleJXA(() => runJXA<string>(`
       ${SLIDE_LOOKUP}
       ${ITEM_LOOKUP}
+      assertUnlocked();
       const shape = item;
       const fmt = params.format;
 
